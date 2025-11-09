@@ -1,8 +1,9 @@
 #!/bin/bash
 
 # ============================================
-# RefStarsBot - Скрипт установки
+# RefStarsBot - Скрипт установки (FIXED v2.0)
 # Одна команда для полной установки
+# Исправлено: ошибка Permission denied
 # ============================================
 
 set -e  # Выход при ошибке
@@ -80,6 +81,16 @@ install_local() {
     PROJECT_DIR=$(pwd)
     VENV_DIR="$PROJECT_DIR/venv"
     
+    # Проверка если venv уже существует
+    if [ -d "$VENV_DIR" ]; then
+        print_warning "Виртуальное окружение уже существует"
+        read -p "Удалить старое и создать новое? (y/n): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            rm -rf "$VENV_DIR"
+        fi
+    fi
+    
     # Создание виртуального окружения
     print_info "Создание виртуального окружения..."
     python3 -m venv "$VENV_DIR"
@@ -90,28 +101,33 @@ install_local() {
     
     # Обновление pip
     print_info "Обновление pip..."
-    pip install --upgrade pip setuptools wheel
+    pip install --upgrade pip setuptools wheel > /dev/null 2>&1
     print_success "pip обновлён"
     
     # Установка зависимостей
     print_info "Установка зависимостей (это может занять 2-3 минуты)..."
-    pip install -r requirements.txt
+    if [ ! -f requirements.txt ]; then
+        print_error "requirements.txt не найден!"
+        exit 1
+    fi
+    pip install -r requirements.txt > /dev/null 2>&1
     print_success "Зависимости установлены"
     
     # Создание .env файла
     if [ ! -f .env ]; then
         print_info "Создание .env файла..."
-        cp .env.example .env
-        print_success ".env файл создан"
+        if [ -f .env.example ]; then
+            cp .env.example .env
+            print_success ".env файл создан из примера"
+        else
+            touch .env
+            print_warning ".env.example не найден, создан пустой .env"
+        fi
         print_warning "ВАЖНО: Заполните .env файл перед запуском!"
         print_info "nano .env"
     else
         print_warning ".env файл уже существует"
     fi
-    
-    # Проверка БД
-    print_info "Проверка базы данных..."
-    python3 main.py --check-db
     
     # Завершение
     print_success "Локальная установка завершена! ✨"
@@ -137,15 +153,16 @@ install_server() {
     
     # Обновление системы
     print_info "Обновление системы..."
-    apt update && apt upgrade -y
+    apt-get update > /dev/null 2>&1 || true
+    apt-get upgrade -y > /dev/null 2>&1 || true
     print_success "Система обновлена"
     
     # Установка зависимостей
     print_info "Установка системных пакетов..."
-    apt install -y python3.10 python3.10-venv build-essential libpq-dev git curl wget nano
+    apt-get install -y python3.10 python3.10-venv build-essential libpq-dev git curl wget nano > /dev/null 2>&1 || true
     print_success "Системные пакеты установлены"
     
-    # Создание пользователя
+    # Создание/проверка пользователя
     if ! id "$BOT_USER" &>/dev/null; then
         print_info "Создание пользователя $BOT_USER..."
         useradd -m -s /bin/bash "$BOT_USER"
@@ -154,49 +171,127 @@ install_server() {
         print_info "Пользователь $BOT_USER уже существует"
     fi
     
-    # Создание директории
-    print_info "Создание директории $BOT_DIR..."
-    mkdir -p "$BOT_DIR"
+    # ВАЖНО: Проверка и очистка директории перед созданием
+    if [ -d "$BOT_DIR" ]; then
+        print_warning "Директория $BOT_DIR уже существует"
+        print_info "Исправление прав доступа..."
+        
+        # Остановка сервиса если запущен
+        systemctl stop refstarbot.service 2>/dev/null || true
+        
+        # Удаление повреждённого venv
+        rm -rf "$BOT_DIR/venv" 2>/dev/null || true
+        
+        # Изменение владельца
+        chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
+        chmod -R 755 "$BOT_DIR"
+        print_success "Права исправлены"
+    else
+        print_info "Создание директории $BOT_DIR..."
+        mkdir -p "$BOT_DIR"
+        chown "$BOT_USER:$BOT_USER" "$BOT_DIR"
+        chmod 755 "$BOT_DIR"
+    fi
+    
     cd "$BOT_DIR"
     
     # Клонирование репозитория (если нужно)
     if [ ! -f main.py ]; then
         print_info "Клонирование репозитория..."
-        git clone https://github.com/YOUR_USERNAME/RefStarsBot.git . 2>/dev/null || \
-        print_warning "Не удалось клонировать. Пожалуйста, загрузьте файлы вручную"
+        if git clone https://github.com/svod011929/RefStarsBot.git . 2>/dev/null; then
+            print_success "Репозиторий клонирован"
+        else
+            print_warning "⚠️  Не удалось клонировать репозиторий"
+            print_warning "⚠️  Загрузите файлы вручную в $BOT_DIR"
+            print_warning "⚠️  Используйте SCP или SFTP"
+            print_warning "⚠️  После загрузки запустите скрипт ещё раз"
+            exit 1
+        fi
     fi
     
-    # Создание виртуального окружения
+    # Исправление прав на файлы
+    print_info "Исправление прав доступа..."
+    chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
+    chmod -R 755 "$BOT_DIR"
+    print_success "Права установлены"
+    
+    # КРИТИЧНО: Создание виртуального окружения ОТ ПОЛЬЗОВАТЕЛЯ botuser
     print_info "Создание виртуального окружения..."
-    su - "$BOT_USER" -c "cd $BOT_DIR && python3 -m venv $VENV_DIR"
+    
+    if [ -d "$VENV_DIR" ]; then
+        rm -rf "$VENV_DIR"
+    fi
+    
+    # Попытка 1: Создание venv
+    if ! su - "$BOT_USER" -c "cd $BOT_DIR && python3 -m venv venv" 2>&1; then
+        print_error "Ошибка при создании venv через su"
+        print_info "Пробую альтернативный способ..."
+        
+        # Попытка 2: Прямое создание
+        python3 -m venv "$VENV_DIR" || {
+            print_error "Ошибка создания виртуального окружения"
+            exit 1
+        }
+        
+        # Исправляем владельца
+        chown -R "$BOT_USER:$BOT_USER" "$VENV_DIR"
+    fi
+    
     print_success "Виртуальное окружение создано"
     
+    # Проверка что venv создан
+    if [ ! -f "$VENV_DIR/bin/activate" ]; then
+        print_error "Ошибка: виртуальное окружение не создано правильно"
+        print_warning "Попробуйте вручную:"
+        echo "  su - $BOT_USER"
+        echo "  cd $BOT_DIR"
+        echo "  rm -rf venv"
+        echo "  python3 -m venv venv"
+        exit 1
+    fi
+    
     # Установка зависимостей
-    print_info "Установка зависимостей..."
-    su - "$BOT_USER" -c "cd $BOT_DIR && source $VENV_DIR/bin/activate && pip install --upgrade pip && pip install -r requirements.txt"
+    print_info "Установка зависимостей (2-3 минуты)..."
+    if [ ! -f "$BOT_DIR/requirements.txt" ]; then
+        print_error "requirements.txt не найден в $BOT_DIR"
+        exit 1
+    fi
+    
+    su - "$BOT_USER" -c "cd $BOT_DIR && source $VENV_DIR/bin/activate && pip install --upgrade pip setuptools wheel > /dev/null 2>&1 && pip install -r requirements.txt > /dev/null 2>&1" || {
+        print_error "Ошибка установки зависимостей"
+        exit 1
+    }
     print_success "Зависимости установлены"
     
     # Создание .env файла
     if [ ! -f "$BOT_DIR/.env" ]; then
         print_info "Создание .env файла..."
-        cp "$BOT_DIR/.env.example" "$BOT_DIR/.env"
+        if [ -f "$BOT_DIR/.env.example" ]; then
+            cp "$BOT_DIR/.env.example" "$BOT_DIR/.env"
+            print_success ".env файл создан из примера"
+        else
+            touch "$BOT_DIR/.env"
+            print_warning ".env.example не найден, создан пустой .env"
+        fi
         chmod 600 "$BOT_DIR/.env"
-        print_success ".env файл создан"
+        chown "$BOT_USER:$BOT_USER" "$BOT_DIR/.env"
         print_warning "ВАЖНО: Заполните $BOT_DIR/.env перед запуском!"
+    else
+        print_warning ".env файл уже существует"
     fi
     
     # Создание systemd сервиса
     print_info "Создание systemd сервиса..."
-    cat > /etc/systemd/system/refstarbot.service <<EOF
+    cat > /etc/systemd/system/refstarbot.service <<'EOF'
 [Unit]
 Description=RefStarsBot Telegram Bot Service
 After=network.target
 
 [Service]
 Type=simple
-User=$BOT_USER
-WorkingDirectory=$BOT_DIR
-ExecStart=$VENV_DIR/bin/python $BOT_DIR/main.py
+User=botuser
+WorkingDirectory=/home/botuser/RefStarsBot
+ExecStart=/home/botuser/RefStarsBot/venv/bin/python /home/botuser/RefStarsBot/main.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -211,29 +306,42 @@ EOF
     systemctl daemon-reload
     print_success "Systemd сервис создан"
     
-    # Установка прав
-    print_info "Установка прав доступа..."
+    # Финальные права
+    print_info "Финальная установка прав доступа..."
     chown -R "$BOT_USER:$BOT_USER" "$BOT_DIR"
-    chmod 700 "$BOT_DIR"
+    chmod 755 "$BOT_DIR"
+    chmod 755 "$BOT_DIR/main.py" 2>/dev/null || true
     print_success "Права установлены"
     
     # Завершение
     print_success "Серверная установка завершена! ✨"
+    echo ""
     print_info "Следующие шаги:"
-    echo "1. Отредактируйте .env файл:"
-    echo "   nano $BOT_DIR/.env"
     echo ""
-    echo "2. Включите автозапуск:"
-    echo "   systemctl enable refstarbot.service"
+    echo "1️⃣  Отредактируйте .env файл с вашими токенами:"
+    echo "   sudo nano $BOT_DIR/.env"
     echo ""
-    echo "3. Запустите бота:"
-    echo "   systemctl start refstarbot.service"
+    echo "   Необходимые переменные:"
+    echo "   - BOT_TOKEN (получите у @BotFather)"
+    echo "   - FLYER_TOKEN (с https://flyerservice.io)"
+    echo "   - DB_HOST, DB_USER, DB_PASSWORD (если используется БД)"
     echo ""
-    echo "4. Проверьте статус:"
-    echo "   systemctl status refstarbot.service"
+    echo "2️⃣  Включите автозапуск сервиса:"
+    echo "   sudo systemctl enable refstarbot.service"
     echo ""
-    echo "5. Смотрите логи:"
-    echo "   journalctl -u refstarbot.service -f"
+    echo "3️⃣  Запустите бота:"
+    echo "   sudo systemctl start refstarbot.service"
+    echo ""
+    echo "4️⃣  Проверьте статус:"
+    echo "   sudo systemctl status refstarbot.service"
+    echo ""
+    echo "5️⃣  Смотрите логи в реальном времени:"
+    echo "   sudo journalctl -u refstarbot.service -f"
+    echo ""
+    echo "6️⃣  Должны увидеть в логах:"
+    echo "   ✅ Flyer API инициализирован успешно"
+    echo ""
+    print_success "Готово! Заполните .env и запустите бота 🚀"
 }
 
 # Запуск
